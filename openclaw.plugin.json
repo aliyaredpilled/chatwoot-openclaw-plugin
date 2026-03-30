@@ -1,0 +1,12 @@
+{
+  "id": "chatwoot",
+  "name": "Chatwoot",
+  "version": "0.1.0",
+  "description": "Chatwoot channel plugin (Agent Bot webhook)",
+  "channels": ["chatwoot"],
+  "configSchema": {
+    "type": "object",
+    "additionalProperties": false,
+    "properties": {}
+  }
+}
