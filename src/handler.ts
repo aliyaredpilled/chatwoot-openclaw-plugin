@@ -1,4 +1,54 @@
-import type { ChatwootApi, ChatwootWebhookPayload, ChatwootAttachment } from "./chatwoot-api.js";
+import { ChatwootApi, type ChatwootWebhookPayload, type ChatwootAttachment } from "./chatwoot-api.js";
+import { GatewayRpc } from "./gateway-rpc.js";
+
+// ── Own-message tracking ──────────────────────────────────────────────
+// When the bot sends a message via Chatwoot API, we store its ID here.
+// Account-level webhooks echo back our own outgoing messages — we skip them.
+
+const OWN_MESSAGE_IDS = new Set<number>();
+const OWN_MSG_TTL = 60_000; // auto-cleanup after 60s
+
+export function trackOwnMessage(id: number) {
+  OWN_MESSAGE_IDS.add(id);
+  setTimeout(() => OWN_MESSAGE_IDS.delete(id), OWN_MSG_TTL);
+}
+
+export function isOwnMessage(id: number): boolean {
+  return OWN_MESSAGE_IDS.has(id);
+}
+
+// ── Gateway RPC (singleton) ─────────────────────────────────────────
+// Used to inject operator messages directly into session transcripts
+// via chat.inject, instead of buffering them in memory.
+
+let gatewayRpc: GatewayRpc | null = null;
+
+export function initGatewayRpc(log?: any) {
+  if (gatewayRpc) return;
+  gatewayRpc = new GatewayRpc({ log });
+}
+
+// ── Operator message buffer (fallback) ──────────────────────────────
+// Kept as fallback if chat.inject fails (e.g. gateway token not configured).
+// When inject succeeds, this buffer is not used.
+
+const OPERATOR_BUFFER = new Map<number, { name: string; text: string; ts: number }[]>();
+const OP_BUF_TTL = 30 * 60_000; // discard after 30 min
+
+function bufferOperatorMessage(conversationId: number, name: string, text: string) {
+  if (!OPERATOR_BUFFER.has(conversationId)) OPERATOR_BUFFER.set(conversationId, []);
+  OPERATOR_BUFFER.get(conversationId)!.push({ name, text, ts: Date.now() });
+}
+
+function drainOperatorMessages(conversationId: number): string {
+  const msgs = OPERATOR_BUFFER.get(conversationId);
+  if (!msgs || msgs.length === 0) return "";
+  OPERATOR_BUFFER.delete(conversationId);
+  const now = Date.now();
+  const fresh = msgs.filter((m) => now - m.ts < OP_BUF_TTL);
+  if (fresh.length === 0) return "";
+  return fresh.map((m) => `[Сообщение от оператора ${m.name}]: ${m.text}`).join("\n");
+}
 
 // ── Constants ──────────────────────────────────────────────────────────
 
@@ -140,70 +190,44 @@ export async function handleChatwootInbound(params: HandleParams) {
     return;
   }
 
-  // ── Handle outgoing messages from human operators → inject into agent session ──
+  // ── Handle outgoing messages from human operators → inject into session transcript ──
   if (payload.message_type === "outgoing") {
+    if (payload.id && isOwnMessage(payload.id)) {
+      log?.info?.(`[chatwoot] skipped own message id=${payload.id}`);
+      return;
+    }
     const senderType = payload.sender?.type;
-    // Only record human operator messages (type "user"), not bot's own messages
     if (senderType === "user" && payload.content && !payload.private) {
       const conversationId = payload.conversation?.id;
       if (conversationId) {
         const operatorName = payload.sender?.name ?? "Оператор";
-        log?.info?.(`[chatwoot] operator message from ${operatorName} (conv ${conversationId}): ${payload.content.slice(0, 50)}`);
-        try {
+
+        // Try to inject directly into session transcript via SessionManager
+        if (gatewayRpc) {
           const route = cr.routing.resolveAgentRoute({
             cfg,
             channel: "chatwoot",
             peer: { kind: "direct" as const, id: String(conversationId) },
           });
-          const storePath = cr.session.resolveStorePath(cfg.session?.store, { agentId: route.agentId });
-          const envelopeOptions = cr.reply.resolveEnvelopeFormatOptions(cfg);
-          const operatorText = `[Оператор ${operatorName}]: ${payload.content}`;
-
-          const body = cr.reply.formatInboundEnvelope({
-            channel: "Chatwoot",
-            from: `Оператор ${operatorName}`,
-            timestamp: Date.now(),
-            envelope: envelopeOptions,
-            body: operatorText,
-            chatType: "direct",
-            senderLabel: `Оператор ${operatorName}`,
+          const storePath = cr.session.resolveStorePath(cfg.session?.store, {
+            agentId: route.agentId,
           });
-
-          const ctxPayload = cr.reply.finalizeInboundContext({
-            Body: body,
-            BodyForAgent: operatorText,
-            RawBody: payload.content,
-            CommandBody: payload.content,
-            From: `chatwoot:operator:${payload.sender?.id ?? 0}`,
-            To: `chatwoot:conv:${conversationId}`,
-            SessionKey: route.sessionKey,
-            AccountId: "default",
-            ChatType: "direct",
-            ConversationLabel: `Оператор ${operatorName}`,
-            SenderName: `Оператор ${operatorName}`,
-            SenderId: String(payload.sender?.id ?? 0),
-            Provider: "chatwoot",
-            Surface: "chatwoot",
-            MessageSid: `op_${payload_id()}`,
-            OriginatingChannel: "chatwoot",
-            OriginatingTo: `chatwoot:conv:${conversationId}`,
-            CommandAuthorized: false,
-            CommandSource: "text",
-          });
-
-          await cr.session.recordInboundSession({
+          const injected = await gatewayRpc.injectMessage(
+            route.sessionKey,
+            payload.content,
+            `Оператор ${operatorName}`,
             storePath,
-            sessionKey: route.sessionKey,
-            ctx: ctxPayload,
-            onRecordError: (err: any) => {
-              log?.warn?.(`[chatwoot] operator session record error: ${err}`);
-            },
-          });
-
-          log?.info?.(`[chatwoot] recorded operator message in session ${route.sessionKey}`);
-        } catch (err: any) {
-          log?.warn?.(`[chatwoot] failed to record operator message: ${err?.message ?? err}`);
+          );
+          if (injected) {
+            log?.info?.(`[chatwoot] injected operator message from ${operatorName} into session ${route.sessionKey}`);
+            return;
+          }
+          log?.warn?.(`[chatwoot] inject failed, falling back to buffer`);
         }
+
+        // Fallback: buffer for next client message
+        bufferOperatorMessage(conversationId, operatorName, payload.content);
+        log?.info?.(`[chatwoot] buffered operator message from ${operatorName} (conv ${conversationId}): ${payload.content.slice(0, 50)}`);
       }
     }
     return;
@@ -344,7 +368,15 @@ type DispatchParams = {
 };
 
 async function dispatchMessage(params: DispatchParams) {
-  const { api, cfg, cr, log, conversationId, accountId, senderId, senderName, text, chatwootCfg, media } = params;
+  const { cfg, cr, log, conversationId, accountId, senderId, senderName, text, chatwootCfg, media } = params;
+
+  // Use Agent Bot token for outbound (shows as "OpenClaw Support" in UI)
+  // Fall back to admin API for inbound operations (getMessages, etc.)
+  const botToken = chatwootCfg.agentBotToken;
+  const botApi = botToken
+    ? new ChatwootApi(chatwootCfg.apiUrl, botToken)
+    : params.api;
+  const api = params.api; // admin API for reads
 
   // 1. Resolve agent route
   const route = cr.routing.resolveAgentRoute({
@@ -363,14 +395,20 @@ async function dispatchMessage(params: DispatchParams) {
     sessionKey: route.sessionKey,
   });
 
-  // 3. Format body
+  // 3. Prepend buffered operator messages (if any)
+  const operatorContext = drainOperatorMessages(conversationId);
+  const bodyWithContext = operatorContext
+    ? `${operatorContext}\n---\n${text}`
+    : text;
+
+  // 4. Format body
   const body = cr.reply.formatInboundEnvelope({
     channel: "Chatwoot",
     from: senderName,
     timestamp: Date.now(),
     previousTimestamp,
     envelope: envelopeOptions,
-    body: text,
+    body: bodyWithContext,
     chatType: "direct",
     senderLabel: senderName,
   });
@@ -383,7 +421,7 @@ async function dispatchMessage(params: DispatchParams) {
 
   const ctxPayload = cr.reply.finalizeInboundContext({
     Body: body,
-    BodyForAgent: text,
+    BodyForAgent: bodyWithContext,
     RawBody: text,
     CommandBody: text,
     From: `chatwoot:${senderId}`,
@@ -444,9 +482,10 @@ async function dispatchMessage(params: DispatchParams) {
     if (responseText.includes("[HANDOFF]")) {
       const cleanText = stripMarkdown(responseText.replace("[HANDOFF]", "").trim());
       if (cleanText) {
-        await api.sendMessage(accountId, conversationId, cleanText);
+        const sent = await botApi.sendMessage(accountId, conversationId, cleanText);
+        if (sent?.id) trackOwnMessage(sent.id);
       }
-      await api.toggleStatus(accountId, conversationId, "open");
+      await botApi.toggleStatus(accountId, conversationId, "open");
       log?.info?.(`[chatwoot] handoff conv ${conversationId} to human agents`);
       return;
     }
@@ -457,7 +496,8 @@ async function dispatchMessage(params: DispatchParams) {
     const limit = chatwootCfg.textChunkLimit ?? TEXT_CHUNK_LIMIT;
     const chunks = chunkText(responseText, limit);
     for (const chunk of chunks) {
-      await api.sendMessage(accountId, conversationId, chunk);
+      const sent = await botApi.sendMessage(accountId, conversationId, chunk);
+      if (sent?.id) trackOwnMessage(sent.id);
     }
   };
 
@@ -483,7 +523,8 @@ async function dispatchMessage(params: DispatchParams) {
   } catch (err: any) {
     log?.error?.(`[chatwoot] dispatch error: ${err?.message ?? err}`);
     try {
-      await api.sendMessage(accountId, conversationId, "Извините, произошла ошибка. Попробуйте ещё раз.");
+      const sent = await botApi.sendMessage(accountId, conversationId, "Извините, произошла ошибка. Попробуйте ещё раз.");
+      if (sent?.id) trackOwnMessage(sent.id);
     } catch {}
   }
 }

@@ -1,6 +1,6 @@
 import { createServer, type IncomingMessage, type ServerResponse } from "node:http";
 import { ChatwootApi } from "./chatwoot-api.js";
-import { handleChatwootInbound } from "./handler.js";
+import { handleChatwootInbound, trackOwnMessage, initGatewayRpc } from "./handler.js";
 
 // ── Helpers ────────────────────────────────────────────────────────────
 
@@ -79,7 +79,8 @@ export const chatwootChannelPlugin = {
       const limit = cwCfg.textChunkLimit ?? TEXT_CHUNK_LIMIT;
       const chunks = chunkText(ctx.text, limit);
       for (const chunk of chunks) {
-        await api.sendMessage(accountId, conversationId, chunk);
+        const sent = await api.sendMessage(accountId, conversationId, chunk);
+        if (sent?.id) trackOwnMessage(sent.id);
       }
       return { ok: true };
     },
@@ -105,6 +106,10 @@ export const chatwootChannelPlugin = {
 
       const webhookPort = cwCfg.webhookPort ?? 18800;
       const api = new ChatwootApi(cwCfg.apiUrl, cwCfg.apiToken);
+
+      // Initialize gateway RPC for injecting operator messages into session transcripts
+      initGatewayRpc(ctx.log);
+      ctx.log?.info?.("[chatwoot] gateway RPC initialized (via CLI)");
 
       ctx.log?.info?.(`[chatwoot] starting webhook server on :${webhookPort}`);
 
