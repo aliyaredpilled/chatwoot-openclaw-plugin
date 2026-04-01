@@ -1,5 +1,14 @@
 import { ChatwootApi, type ChatwootWebhookPayload, type ChatwootAttachment } from "./chatwoot-api.js";
 import { GatewayRpc } from "./gateway-rpc.js";
+import { buildAndSaveCorrectionRecord } from "./correction-store.js";
+import {
+  CORRECTION_FEEDBACK_MARKER,
+  HANDOFF_MARKER,
+  NO_REPLY_MARKER,
+  SUGGESTION_MARKER,
+  TRACE_MARKER,
+  WORKING_MARKER,
+} from "./technical-markers.js";
 
 // ── Own-message tracking ──────────────────────────────────────────────
 // When the bot sends a message via Chatwoot API, we store its ID here.
@@ -36,9 +45,14 @@ export function initGatewayRpc(log?: any) {
 const PENDING_SUGGESTIONS = new Map<number, { text: string; ts: number; runId?: string }>();
 const SUGGESTION_TTL = 30 * 60_000; // discard after 30 min
 
-export const SUGGESTION_MARKER = "[AGENT_SUGGESTION]";
-export const WORKING_MARKER = "[AGENT_WORKING]";
-export const TRACE_MARKER = "[AGENT_TRACE]";
+export {
+  SUGGESTION_MARKER,
+  WORKING_MARKER,
+  TRACE_MARKER,
+  HANDOFF_MARKER,
+  NO_REPLY_MARKER,
+  CORRECTION_FEEDBACK_MARKER,
+};
 
 function storeSuggestion(conversationId: number, text: string, runId?: string) {
   PENDING_SUGGESTIONS.set(conversationId, { text, ts: Date.now(), runId });
@@ -71,6 +85,73 @@ async function sendTechnicalNote(params: {
   });
   if (sent?.id) trackOwnMessage(sent.id);
   return sent;
+}
+
+function parseTechnicalNote<T = Record<string, any>>(content: string | undefined, marker: string): { raw: string; data: T | null } | null {
+  if (!content || !content.startsWith(marker)) return null;
+  const raw = content.slice(marker.length).trim();
+  if (!raw) return { raw: "", data: null };
+  try {
+    return { raw, data: JSON.parse(raw) as T };
+  } catch {
+    return { raw, data: null };
+  }
+}
+
+async function persistCorrectionFeedback(params: {
+  api: ChatwootApi;
+  payload: ChatwootWebhookPayload;
+  accountId: number;
+  conversationId: number;
+  log?: any;
+}) {
+  const { api, payload, accountId, conversationId, log } = params;
+  const parsed = parseTechnicalNote<{
+    version?: number;
+    runId?: string;
+    publicMessageId?: number | null;
+    suggestionMessageId?: number | null;
+    traceMessageId?: number | null;
+    suggestion?: string;
+    finalText?: string;
+    comment?: string;
+    savedAt?: string;
+  }>(payload.content, CORRECTION_FEEDBACK_MARKER);
+
+  const feedback = parsed?.data;
+  const runId = String(feedback?.runId ?? "").trim();
+  const comment = String(feedback?.comment ?? "").trim();
+  const finalText = String(feedback?.finalText ?? "").trim();
+
+  if (!runId || !comment || !finalText) {
+    log?.warn?.(`[chatwoot] correction feedback skipped: incomplete payload for conv ${conversationId}`);
+    return null;
+  }
+
+  const saved = await buildAndSaveCorrectionRecord({
+    api,
+    accountId,
+    conversationId,
+    operator: {
+      id: payload.sender?.id,
+      name: payload.sender?.name,
+    },
+    feedback: {
+      ...feedback,
+      runId,
+      comment,
+      finalText,
+      savedAt: feedback?.savedAt ?? new Date().toISOString(),
+    },
+  });
+
+  if (!saved) {
+    log?.info?.(`[chatwoot] correction feedback skipped for run ${runId}`);
+    return null;
+  }
+
+  log?.info?.(`[chatwoot] correction dataset saved for run ${runId}: ${saved.filePath}`);
+  return saved;
 }
 
 // ── Operator message buffer (fallback) ──────────────────────────────
@@ -404,8 +485,31 @@ export async function handleChatwootInbound(params: HandleParams) {
       return;
     }
     const senderType = payload.sender?.type;
+    const conversationId = payload.conversation?.id;
+    const accountId = payload.account?.id ?? chatwootCfg.accountId ?? 1;
+
+    if (
+      senderType === "user"
+      && payload.private
+      && payload.content
+      && payload.content.startsWith(CORRECTION_FEEDBACK_MARKER)
+      && conversationId
+    ) {
+      try {
+        await persistCorrectionFeedback({
+          api,
+          payload,
+          accountId,
+          conversationId,
+          log,
+        });
+      } catch (err: any) {
+        log?.warn?.(`[chatwoot] correction feedback persistence failed for conv ${conversationId}: ${err?.message ?? err}`);
+      }
+      return;
+    }
+
     if (senderType === "user" && payload.content && !payload.private) {
-      const conversationId = payload.conversation?.id;
       if (conversationId) {
         const operatorName = payload.sender?.name ?? "Оператор";
         const suggestion = isCopilot ? consumeSuggestion(conversationId) : null;
@@ -476,7 +580,7 @@ ${payload.content}`;
           cr,
           log,
           conversationId,
-          accountId: payload.account?.id ?? chatwootCfg.accountId ?? 1,
+          accountId,
           senderId: payload.sender.id,
           senderName: payload.sender.name ?? String(payload.sender.id),
           text: payload.content,
@@ -757,6 +861,19 @@ async function dispatchMessage(params: DispatchParams) {
     // Check for no-reply marker — agent decided to stay silent (operator is handling)
     const NO_REPLY = /\[NO_REPLY\]|no_reply/i;
     if (NO_REPLY.test(responseText.trim())) {
+      await sendTechnicalNote({
+        api,
+        accountId,
+        conversationId,
+        marker: NO_REPLY_MARKER,
+        data: {
+          runId,
+          startedAt,
+          finishedAt: new Date().toISOString(),
+          conversationId,
+          reason: "operator_handling",
+        },
+      });
       log?.info?.(`[chatwoot] agent chose no_reply for conv ${conversationId}`);
       return;
     }
@@ -769,6 +886,19 @@ async function dispatchMessage(params: DispatchParams) {
         if (sent?.id) trackOwnMessage(sent.id);
       }
       await botApi.toggleStatus(accountId, conversationId, "open");
+      await sendTechnicalNote({
+        api,
+        accountId,
+        conversationId,
+        marker: HANDOFF_MARKER,
+        data: {
+          runId,
+          startedAt,
+          finishedAt: new Date().toISOString(),
+          conversationId,
+          text: cleanText,
+        },
+      });
       log?.info?.(`[chatwoot] handoff conv ${conversationId} to human agents`);
       return;
     }

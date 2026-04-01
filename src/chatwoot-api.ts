@@ -12,6 +12,7 @@ export type ChatwootMessage = {
   private: boolean;
   created_at: string;
   conversation_id: number;
+  content_attributes?: Record<string, unknown>;
   sender?: {
     id: number;
     name: string;
@@ -46,6 +47,7 @@ export type ChatwootWebhookPayload = {
   private?: boolean;
   created_at?: string;
   content_type?: string;
+  content_attributes?: Record<string, unknown>;
   conversation?: {
     id: number;
     status: string;
