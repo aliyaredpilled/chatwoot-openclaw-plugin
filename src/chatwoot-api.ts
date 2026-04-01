@@ -149,4 +149,17 @@ export class ChatwootApi {
       `/api/v1/accounts/${accountId}/conversations/${conversationId}`,
     );
   }
+
+  async toggleTyping(
+    accountId: number,
+    conversationId: number,
+    typingStatus: "on" | "off",
+    isPrivate = true,
+  ): Promise<unknown> {
+    return this.request(
+      `/api/v1/accounts/${accountId}/conversations/${conversationId}/toggle_typing_status`,
+      "POST",
+      { typing_status: typingStatus, is_private: isPrivate },
+    );
+  }
 }

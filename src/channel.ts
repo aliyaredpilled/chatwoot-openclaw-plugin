@@ -71,9 +71,11 @@ export const chatwootChannelPlugin = {
 
       const api = new ChatwootApi(cwCfg.apiUrl, cwCfg.apiToken);
       const to = ctx.to ?? "";
+      // agent-relay passes peerId ("37"), normal pipeline passes "chatwoot:conv:37"
       const convMatch = to.match(/chatwoot:conv:(\d+)/);
-      if (!convMatch) return { ok: false, error: `Cannot resolve target: ${to}` };
-      const conversationId = Number(convMatch[1]);
+      const peerMatch = to.match(/^(\d+)$/);
+      if (!convMatch && !peerMatch) return { ok: false, error: `Cannot resolve target: ${to}` };
+      const conversationId = convMatch ? Number(convMatch[1]) : Number(to);
       const accountId = cwCfg.accountId ?? 1;
 
       const limit = cwCfg.textChunkLimit ?? TEXT_CHUNK_LIMIT;

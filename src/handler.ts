@@ -28,6 +28,51 @@ export function initGatewayRpc(log?: any) {
   gatewayRpc = new GatewayRpc({ log });
 }
 
+// ── Copilot: pending suggestions ────────────────────────────────────
+// When copilot mode is enabled, agent suggestions are sent as private notes
+// instead of direct replies. We track them here to compare with operator's
+// actual response and inject feedback into the session transcript.
+
+const PENDING_SUGGESTIONS = new Map<number, { text: string; ts: number; runId?: string }>();
+const SUGGESTION_TTL = 30 * 60_000; // discard after 30 min
+
+export const SUGGESTION_MARKER = "[AGENT_SUGGESTION]";
+export const WORKING_MARKER = "[AGENT_WORKING]";
+export const TRACE_MARKER = "[AGENT_TRACE]";
+
+function storeSuggestion(conversationId: number, text: string, runId?: string) {
+  PENDING_SUGGESTIONS.set(conversationId, { text, ts: Date.now(), runId });
+}
+
+function consumeSuggestion(conversationId: number): string | null {
+  const entry = PENDING_SUGGESTIONS.get(conversationId);
+  if (!entry) return null;
+  PENDING_SUGGESTIONS.delete(conversationId);
+  if (Date.now() - entry.ts > SUGGESTION_TTL) return null;
+  return entry.text;
+}
+
+async function sendTechnicalNote(params: {
+  api: ChatwootApi;
+  accountId: number;
+  conversationId: number;
+  marker: string;
+  text?: string;
+  data?: Record<string, any>;
+}) {
+  const { api, accountId, conversationId, marker, text, data } = params;
+  const content = data
+    ? `${marker}\n${JSON.stringify(data)}`
+    : text
+      ? `${marker}\n${text}`
+      : marker;
+  const sent = await api.sendMessage(accountId, conversationId, content, {
+    isPrivate: true,
+  });
+  if (sent?.id) trackOwnMessage(sent.id);
+  return sent;
+}
+
 // ── Operator message buffer (fallback) ──────────────────────────────
 // Kept as fallback if chat.inject fails (e.g. gateway token not configured).
 // When inject succeeds, this buffer is not used.
@@ -126,6 +171,167 @@ function chunkText(text: string, limit: number): string[] {
   return chunks;
 }
 
+function truncateText(text: string, limit = 240): string {
+  const normalized = text.replace(/\s+/g, " ").trim();
+  if (normalized.length <= limit) return normalized;
+  return `${normalized.slice(0, Math.max(0, limit - 1)).trimEnd()}…`;
+}
+
+function summarizeUnknown(value: unknown, limit = 240): string {
+  if (typeof value === "string") return truncateText(value, limit);
+  if (value === null || value === undefined) return "";
+  try {
+    return truncateText(JSON.stringify(value), limit);
+  } catch {
+    return truncateText(String(value), limit);
+  }
+}
+
+function summarizeToolResult(message: any, limit = 240): string {
+  const details = message?.details;
+  if (details?.results && Array.isArray(details.results)) {
+    const preview = details.results
+      .slice(0, 3)
+      .map((item: any) => item?.citation ?? item?.path ?? item?.title ?? summarizeUnknown(item, 60))
+      .filter(Boolean);
+    const suffix = details.results.length > preview.length ? ` (+${details.results.length - preview.length} more)` : "";
+    return truncateText(`Found ${details.results.length} result(s): ${preview.join(", ")}${suffix}`, limit);
+  }
+
+  const firstText = message?.content?.find?.((item: any) => item?.type === "text")?.text;
+  if (typeof firstText === "string" && firstText.trim()) {
+    return truncateText(firstText, limit);
+  }
+
+  if (details) return summarizeUnknown(details, limit);
+  return message?.isError ? "Tool returned an error." : "Tool completed.";
+}
+
+function summarizeThinkingItem(item: any, limit = 4000): string | null {
+  if (!item || item.type !== "thinking") return null;
+
+  const signature = item.thinkingSignature;
+  if (typeof signature === "string") {
+    try {
+      const parsed = JSON.parse(signature);
+      const summaryText = parsed?.summary?.find?.((entry: any) => entry?.type === "summary_text")?.text;
+      if (typeof summaryText === "string" && summaryText.trim()) {
+        return truncateText(summaryText, limit);
+      }
+    } catch {}
+  }
+
+  if (typeof item.thinking === "string" && item.thinking.trim()) {
+    return truncateText(item.thinking, limit);
+  }
+
+  return null;
+}
+
+function buildTracePayload(params: {
+  runId: string;
+  conversationId: number;
+  senderName: string;
+  inboundText: string;
+  startedAt: string;
+  finishedAt: string;
+  finalText?: string;
+  transcriptEntries?: any[];
+}) {
+  const {
+    runId,
+    conversationId,
+    senderName,
+    inboundText,
+    startedAt,
+    finishedAt,
+    finalText,
+    transcriptEntries = [],
+  } = params;
+
+  const steps: Record<string, any>[] = [
+    {
+      type: "inbound",
+      title: `Message from ${senderName}`,
+      text: truncateText(inboundText, 280),
+      timestamp: startedAt,
+    },
+    {
+      type: "working",
+      title: "Agent working",
+      timestamp: startedAt,
+    },
+  ];
+
+  for (const entry of transcriptEntries) {
+    if (entry?.type !== "message" || !entry.message) continue;
+    const message = entry.message;
+    const timestamp = entry.timestamp ?? (typeof message.timestamp === "number" ? new Date(message.timestamp).toISOString() : undefined);
+
+    if (message.role === "assistant" && Array.isArray(message.content)) {
+      for (const item of message.content) {
+        if (item?.type === "toolCall") {
+          steps.push({
+            type: "tool_call",
+            title: `Called ${item.name ?? "tool"}`,
+            toolName: item.name ?? "tool",
+            inputSummary: summarizeUnknown(item.arguments ?? item.partialJson ?? {}, 220),
+            timestamp,
+          });
+          continue;
+        }
+
+        const thinking = summarizeThinkingItem(item);
+        if (thinking) {
+          steps.push({
+            type: "note",
+            title: "Reasoning note",
+            content: thinking,
+            timestamp,
+          });
+        }
+      }
+
+      continue;
+    }
+
+    if (message.role === "toolResult") {
+      steps.push({
+        type: message.isError ? "tool_error" : "tool_result",
+        title: message.isError ? `${message.toolName ?? "Tool"} failed` : `${message.toolName ?? "Tool"} returned`,
+        toolName: message.toolName ?? undefined,
+        outputSummary: summarizeToolResult(message, 240),
+        timestamp,
+      });
+    }
+  }
+
+  if (finalText) {
+    steps.push({
+      type: "final",
+      title: "Final suggestion",
+      text: truncateText(finalText, 600),
+      timestamp: finishedAt,
+    });
+  }
+
+  const uiSteps = steps.length <= 24
+    ? steps
+    : [...steps.slice(0, 23), steps[steps.length - 1]];
+
+  return {
+    version: 1,
+    runId,
+    conversationId,
+    status: finalText ? "completed" : "no_reply",
+    startedAt,
+    finishedAt,
+    finalText: finalText ? truncateText(finalText, 1200) : "",
+    stepCount: steps.length,
+    steps: uiSteps,
+  };
+}
+
 // ── Media resolution ──────────────────────────────────────────────────
 
 type ResolvedMedia = { path: string; contentType?: string };
@@ -181,6 +387,7 @@ type HandleParams = {
 
 export async function handleChatwootInbound(params: HandleParams) {
   const { payload, api, cfg, cr, log, chatwootCfg } = params;
+  const isCopilot = chatwootCfg.copilot === true;
 
   log?.info?.(`[chatwoot] webhook received: event=${payload.event} type=${payload.message_type} sender=${JSON.stringify(payload.sender)} conv_status=${payload.conversation?.status} private=${payload.private} content=${(payload.content ?? "").slice(0, 50)}`);
 
@@ -190,7 +397,7 @@ export async function handleChatwootInbound(params: HandleParams) {
     return;
   }
 
-  // ── Handle outgoing messages from human operators → inject into session transcript ──
+  // ── Handle outgoing messages from human operators ──
   if (payload.message_type === "outgoing") {
     if (payload.id && isOwnMessage(payload.id)) {
       log?.info?.(`[chatwoot] skipped own message id=${payload.id}`);
@@ -201,6 +408,7 @@ export async function handleChatwootInbound(params: HandleParams) {
       const conversationId = payload.conversation?.id;
       if (conversationId) {
         const operatorName = payload.sender?.name ?? "Оператор";
+        const suggestion = isCopilot ? consumeSuggestion(conversationId) : null;
 
         // Try to inject directly into session transcript via SessionManager
         if (gatewayRpc) {
@@ -212,22 +420,70 @@ export async function handleChatwootInbound(params: HandleParams) {
           const storePath = cr.session.resolveStorePath(cfg.session?.store, {
             agentId: route.agentId,
           });
-          const injected = await gatewayRpc.injectMessage(
-            route.sessionKey,
-            payload.content,
-            `Оператор ${operatorName}`,
-            storePath,
-          );
-          if (injected) {
-            log?.info?.(`[chatwoot] injected operator message from ${operatorName} into session ${route.sessionKey}`);
-            return;
+
+          if (suggestion) {
+            const modified = suggestion.trim() !== payload.content.trim();
+            const feedbackText = modified
+              ? `[Коррекция от оператора ${operatorName}]
+Предложение агента:
+${suggestion}
+
+Отправлено клиенту:
+${payload.content}`
+              : `[Оператор ${operatorName} одобрил ответ агента без изменений]
+${payload.content}`;
+            const injected = await gatewayRpc.injectFeedback(
+              route.sessionKey,
+              feedbackText,
+              storePath,
+            );
+            if (injected) {
+              log?.info?.(`[chatwoot] injected copilot feedback from ${operatorName} into session ${route.sessionKey}`);
+            } else {
+              log?.warn?.(`[chatwoot] feedback inject failed, falling back to buffer`);
+              bufferOperatorMessage(conversationId, operatorName, payload.content);
+            }
+          } else {
+            const injected = await gatewayRpc.injectMessage(
+              route.sessionKey,
+              payload.content,
+              `Оператор ${operatorName}`,
+              storePath,
+            );
+            if (injected) {
+              log?.info?.(`[chatwoot] injected operator message from ${operatorName} into session ${route.sessionKey}`);
+            } else {
+              log?.warn?.(`[chatwoot] inject failed, falling back to buffer`);
+              bufferOperatorMessage(conversationId, operatorName, payload.content);
+            }
           }
-          log?.warn?.(`[chatwoot] inject failed, falling back to buffer`);
+        } else {
+          // Fallback: buffer for next client message
+          bufferOperatorMessage(conversationId, operatorName, payload.content);
+          log?.info?.(`[chatwoot] buffered operator message from ${operatorName} (conv ${conversationId}): ${payload.content.slice(0, 50)}`);
         }
 
-        // Fallback: buffer for next client message
-        bufferOperatorMessage(conversationId, operatorName, payload.content);
-        log?.info?.(`[chatwoot] buffered operator message from ${operatorName} (conv ${conversationId}): ${payload.content.slice(0, 50)}`);
+        // In copilot mode, operator outgoing is the human-approved final answer.
+        // Do not spin up another AI turn from the operator's public reply.
+        if (isCopilot) {
+          log?.info?.(`[chatwoot] copilot: recorded operator reply without redispatch for conv ${conversationId}`);
+          return;
+        }
+
+        await dispatchMessage({
+          api,
+          cfg,
+          cr,
+          log,
+          conversationId,
+          accountId: payload.account?.id ?? chatwootCfg.accountId ?? 1,
+          senderId: payload.sender.id,
+          senderName: payload.sender.name ?? String(payload.sender.id),
+          text: payload.content,
+          chatwootCfg,
+          media: [],
+        });
+        return;
       }
     }
     return;
@@ -369,6 +625,9 @@ type DispatchParams = {
 
 async function dispatchMessage(params: DispatchParams) {
   const { cfg, cr, log, conversationId, accountId, senderId, senderName, text, chatwootCfg, media } = params;
+  const isCopilot = chatwootCfg.copilot === true;
+  const runId = `cw_${conversationId}_${payload_id()}`;
+  const startedAt = new Date().toISOString();
 
   // Use Agent Bot token for outbound (shows as "OpenClaw Support" in UI)
   // Fall back to admin API for inbound operations (getMessages, etc.)
@@ -464,6 +723,30 @@ async function dispatchMessage(params: DispatchParams) {
     },
   });
 
+  const transcriptBaseline = gatewayRpc?.readTranscriptEntries(sessionKey, storePath)?.totalLines ?? 0;
+  let finalSuggestionText = "";
+
+  if (isCopilot) {
+    try {
+      await sendTechnicalNote({
+        api,
+        accountId,
+        conversationId,
+        marker: WORKING_MARKER,
+        data: {
+          runId,
+          startedAt,
+          conversationId,
+        },
+      });
+      log?.info?.(`[chatwoot] copilot working marker sent for conv ${conversationId}`);
+    } catch (err: any) {
+      log?.warn?.(
+        `[chatwoot] failed to send working marker for conv ${conversationId}: ${err?.message ?? err}`,
+      );
+    }
+  }
+
   log?.info?.(`[chatwoot] inbound from ${senderName} (conv ${conversationId}): ${text.slice(0, 80)}`);
 
   // 6. Delivery function
@@ -493,6 +776,28 @@ async function dispatchMessage(params: DispatchParams) {
     // Strip markdown — Umnico doesn't support formatting
     responseText = stripMarkdown(responseText);
 
+    // ── Copilot mode: send as private note for operator review ──
+    if (isCopilot) {
+      finalSuggestionText = responseText;
+      storeSuggestion(conversationId, responseText, runId);
+      await sendTechnicalNote({
+        api,
+        accountId,
+        conversationId,
+        marker: SUGGESTION_MARKER,
+        data: {
+          runId,
+          text: responseText,
+          startedAt,
+          finishedAt: new Date().toISOString(),
+          conversationId,
+        },
+      });
+      log?.info?.(`[chatwoot] copilot suggestion sent as private note for conv ${conversationId}`);
+      return;
+    }
+
+    // ── Direct mode: send to client ──
     const limit = chatwootCfg.textChunkLimit ?? TEXT_CHUNK_LIMIT;
     const chunks = chunkText(responseText, limit);
     for (const chunk of chunks) {
@@ -509,15 +814,55 @@ async function dispatchMessage(params: DispatchParams) {
       dispatcherOptions: {
         deliver,
         typingCallbacks: {
-          onReplyStart: () => {},
-          onIdle: () => {},
-          onCleanup: () => {},
+          onReplyStart: async () => {
+            try {
+              await botApi.toggleTyping(accountId, conversationId, "on", true);
+            } catch {}
+          },
+          onIdle: () => {
+            botApi.toggleTyping(accountId, conversationId, "off", true).catch(() => {});
+          },
+          onCleanup: () => {
+            botApi.toggleTyping(accountId, conversationId, "off", true).catch(() => {});
+          },
         },
         onError: (err: any, info: any) => {
           log?.error?.(`[chatwoot] reply delivery error (${info?.kind}): ${err}`);
         },
       },
     });
+
+    if (isCopilot && finalSuggestionText) {
+      try {
+        const transcript = gatewayRpc?.readTranscriptEntries(sessionKey, storePath, {
+          startLine: transcriptBaseline,
+        });
+        const finishedAt = new Date().toISOString();
+        const tracePayload = buildTracePayload({
+          runId,
+          conversationId,
+          senderName,
+          inboundText: text,
+          startedAt,
+          finishedAt,
+          finalText: finalSuggestionText,
+          transcriptEntries: transcript?.entries,
+        });
+
+        await sendTechnicalNote({
+          api,
+          accountId,
+          conversationId,
+          marker: TRACE_MARKER,
+          data: tracePayload,
+        });
+        log?.info?.(
+          `[chatwoot] copilot trace sent for conv ${conversationId} run ${runId} (${tracePayload.stepCount} steps)`,
+        );
+      } catch (err: any) {
+        log?.warn?.(`[chatwoot] failed to build/send trace for conv ${conversationId}: ${err?.message ?? err}`);
+      }
+    }
 
     log?.info?.(`[chatwoot] replied to conv ${conversationId}`);
   } catch (err: any) {
